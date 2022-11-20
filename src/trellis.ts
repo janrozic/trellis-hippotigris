@@ -5,7 +5,7 @@ import { getTextWidth, noop, parseNumber } from "./helpers";
 type Data = d3.DSVRowArray<string>;
 type DataRow = d3.DSVRowString<string>;
 type Selection<T extends d3.BaseType> = d3.Selection<T, any, HTMLElement, any>;
-type Grouped = ReturnType<typeof d3.group<DataRow, string>>;
+type Grouped<T = DataRow[]> = d3.InternMap<string, T>;
 
 export default class Trellis {
 
@@ -14,20 +14,40 @@ export default class Trellis {
   public constructor(data: Data, elementSelector = "body") {
     this.data = data;
     this.rootSelector = elementSelector;
-    this.setData(data.columns[0], data.columns[2], data.columns[1]);
+    this.setAxes(data.columns[0], data.columns[2], data.columns[1]);
   }
 
-  private grouped: {[k in "x" | "y"]: Grouped};
+  private grouped: {x: Grouped, y: Grouped, maxes: Grouped<number>};
   private numericProperty: string;
   private xProperty: string;
   private yProperty: string;
-  private setData = (numericProperty: string, xProperty: string, yProperty: string) => {
+  public setAxes = (numericProperty: string, xProperty: string, yProperty: string, order?: "asc" | "desc" | undefined) => {
     this.numericProperty = numericProperty;
     this.xProperty = xProperty;
     this.yProperty = yProperty;
+    type Tuple = [DataRow[], number];
+    const sortK = order === "desc" ? -1 : 1;
+    let getAggregate = (property: string) => d3.group(this.data, d => d[property]);
+    let xMaxes = d3.rollup(this.data, v => d3.max(v, this.getNumericValue), d => d[xProperty]);
+    if (order) {
+      getAggregate = (property: string) => new d3.InternMap(
+        d3.rollups(
+          this.data,
+          (d): Tuple => [d, d3.max(d, this.getNumericValue)], 
+          d => d[property]
+        )
+        .sort((a: [string, Tuple], b: [string, Tuple]) => (a[1][1] - b[1][1]) * sortK)
+        .map(([k, v]) => [k, v[0]])
+      );
+      xMaxes = new d3.InternMap(
+        d3.rollups(this.data, v => d3.max(v, this.getNumericValue), d => d[xProperty])
+        .sort((a, b) => (a[1] - b[1]) * sortK)
+      );
+    }
     this.grouped = {
-      x: d3.group(this.data, d => d[xProperty]),
-      y: d3.group(this.data, d => d[yProperty]),
+      x: getAggregate(xProperty),
+      y: getAggregate(yProperty),
+      maxes: xMaxes,
     };
   }
 
@@ -85,12 +105,7 @@ export default class Trellis {
   }
 
   private calculateScales = () => {
-    const getAggregate = (property: string, aggregate: "min" | "max" | "sum") =>
-      d3.rollup(this.data, v => d3[aggregate as "max"](v, this.getNumericValue), d => d[property])
-    ;
-
-    const byXMaxes = getAggregate(this.xProperty, "max");
-    const movingMaxSum = Array.from(byXMaxes.values()).reduce<number[]>((acc, val) => [...acc, acc[acc.length - 1] + val], [0]);
+    const movingMaxSum = Array.from(this.grouped.maxes.values()).reduce<number[]>((acc, val) => [...acc, acc[acc.length - 1] + val], [0]);
     const maxByXSum = movingMaxSum.pop();
     const xPositions = Object.fromEntries(Array.from(this.grouped.x.keys(),
       (k, index) => [k, {
@@ -120,7 +135,7 @@ export default class Trellis {
     const colorScale = d3
       .scaleSequential()
       .domain([minAll, maxAll])
-      .interpolator((t: number) => d3.interpolateBlues(0.5 + t * 0.5))
+      .interpolator(d3.interpolateRgb("#939597", "#6667AB"))
     ;
     const scales = {
       leftPadding,
@@ -151,52 +166,77 @@ export default class Trellis {
 
   private renderAxes = () => {
     this.axisHolder.selectChildren().remove();
-    this.axisHolder
+    const yaxis = this.axisHolder
       .append("g")
+      .attr("class", "main")
       .attr("transform", `translate(${margin.left + this.scales.leftPadding}, 0)`)
-      .style("font", `${font.face} ${font.size}px`)
+      // .attr("font-size", font.size)
+      // .attr("font-family", font.face)
       .call(d3.axisLeft(this.scales.yScale))
+      // .remove()
+    ;
+    yaxis
       .selectAll("path.domain, line")
       .remove()
     ;
+    yaxis
+      .selectAll("text")
+      .attr("font-size", font.size)
+      .attr("font-family", font.face)
+    ;
+    this.axisHolder
+      .selectChildren("g.group")
+      .data(this.grouped.x.keys())
+      .join(enter => 
+        enter.append("g")
+          .attr("class", "group")
+          .attr("transform", (a) => `translate(${this.getLeftOffset(a)}, ${topPadding})`)
+          .call(d3.axisLeft(this.scales.yScale))
+      )
+      .selectAll("text, line")
+      .remove()
+    ;
+    
     this.axisHolder.selectChildren("text")
       .data(this.grouped.x.keys())
       .join("text")
-      .html(noop)
+      .text(noop)
+      .attr("font-size", font.size)
+      .attr("font-family", font.face)
       .attr("transform", (a) => `translate(${this.getLeftOffset(a)}, ${margin.top + topPadding})`)
     ;
   }
 
-  public render() {
+  private render() {
     this.renderAxes();
-
-    // const group = holder
-    //   .selectAll("g.set")
-    //   .data(by1)
-    //   .join("g")
-    //   .attr("class", "set")
-    // .attr("transform", (a) => `translate(${xScale(a)}, 0)`)
-    ;
-
-    // Rectangles
 
     this.barsHolder.selectChildren("rect")
       .data(this.data)
-      .join("rect")
-      .attr("fill", (a) => this.scales.colorScale(this.getNumericValue(a)))
-      .attr("width", (a) => this.scales.xScale(this.getNumericValue(a)))
-      .attr("height", this.scales.yScale.bandwidth())
-      .attr("x", this.getLeftOffset)
-      .attr("y", (a) => this.scales.yScale(a[this.yProperty]))
+      .join(
+        (enter) => enter
+          .append("rect")
+          .attr("fill", (a) => this.scales.colorScale(this.getNumericValue(a)))
+          .attr("width", (a) => this.scales.xScale(this.getNumericValue(a)))
+          .attr("height", this.scales.yScale.bandwidth())
+          .attr("x", this.getLeftOffset)
+          .attr("y", (a) => this.scales.yScale(a[this.yProperty]))
+        ,
+        (update) => update
+          .transition()
+          .duration(500)
+          .attr("x", this.getLeftOffset)
+          .attr("y", (a) => this.scales.yScale(a[this.yProperty]))
+      )
+      // .attr("fill", (a) => this.scales.colorScale(this.getNumericValue(a)))
+      // .attr("width", (a) => this.scales.xScale(this.getNumericValue(a)))
+      // .attr("height", this.scales.yScale.bandwidth())
+      // .attr("x", this.getLeftOffset)
+      // .attr("y", (a) => this.scales.yScale(a[this.yProperty]))
     ;
   }
-  private rerender() {
+  public rerender() {
     this._scales = this.calculateScales();
     this.render();
-  }
-  public transpose = () => {
-    this.setData(this.numericProperty, this.yProperty, this.xProperty);
-    this.rerender();
   }
   public destroy = () => {
     this._root.remove();
