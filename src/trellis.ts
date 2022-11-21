@@ -230,6 +230,9 @@ export default class Trellis {
         (update) => update
           .transition()
           .duration(1000)
+          .attr("fill", (a) => this.scales.colorScale(this.getNumericValue(a)))
+          .attr("width", (a) => this.scales.xScale(this.getNumericValue(a)))
+          .attr("height", this.scales.yScale.bandwidth())
           .attr("x", this.getLeftOffset)
           .attr("y", (a) => this.scales.yScale(a[this.yProperty]))
         ,
