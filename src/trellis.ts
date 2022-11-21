@@ -1,11 +1,7 @@
 import * as d3 from "d3";
 import { font, margin, size, topPadding } from "./constants";
-import { getTextWidth, noop, parseNumber } from "./helpers";
-
-type Data = d3.DSVRowArray<string>;
-type DataRow = d3.DSVRowString<string>;
-type Selection<T extends d3.BaseType> = d3.Selection<T, any, HTMLElement, any>;
-type Grouped<T = DataRow[]> = d3.InternMap<string, T>;
+import { getTextWidth, noop, parseNumber, uniqueValues } from "./helpers";
+import { Data, Grouped, DataRow, D3Selection } from "./types";
 
 export default class Trellis {
 
@@ -14,46 +10,54 @@ export default class Trellis {
   public constructor(data: Data, elementSelector = "body") {
     this.data = data;
     this.rootSelector = elementSelector;
-    this.setAxes(data.columns[0], data.columns[2], data.columns[1]);
   }
 
-  private grouped: {x: Grouped, y: Grouped, maxes: Grouped<number>};
+  private grouped: {x: Grouped, yKeys: string[], maxes: Grouped<number>, sorted: DataRow[]};
   private numericProperty: string;
   private xProperty: string;
   private yProperty: string;
-  public setAxes = (numericProperty: string, xProperty: string, yProperty: string, order?: "asc" | "desc" | undefined) => {
+  public setAxes = (numericProperty: string, xProperty: string, yProperty: string, order?: "asc" | "desc" | "alpha" | undefined) => {
     this.numericProperty = numericProperty;
     this.xProperty = xProperty;
     this.yProperty = yProperty;
-    type Tuple = [DataRow[], number];
-    const sortK = order === "desc" ? -1 : 1;
-    let getAggregate = (property: string) => d3.group(this.data, d => d[property]);
-    let xMaxes = d3.rollup(this.data, v => d3.max(v, this.getNumericValue), d => d[xProperty]);
-    if (order) {
-      getAggregate = (property: string) => new d3.InternMap(
-        d3.rollups(
-          this.data,
-          (d): Tuple => [d, d3.max(d, this.getNumericValue)], 
-          d => d[property]
-        )
-        .sort((a: [string, Tuple], b: [string, Tuple]) => (a[1][1] - b[1][1]) * sortK)
-        .map(([k, v]) => [k, v[0]])
-      );
-      xMaxes = new d3.InternMap(
-        d3.rollups(this.data, v => d3.max(v, this.getNumericValue), d => d[xProperty])
-        .sort((a, b) => (a[1] - b[1]) * sortK)
-      );
-    }
+    const sorted = order ? this.getSortedData(order) : this.data;
+    const maxes = d3.rollup(sorted, v => d3.max(v, this.getNumericValue), d => d[xProperty]);
+    const yKeys = uniqueValues(sorted, yProperty);
+    const x = d3.group(sorted, d => d[xProperty]);
     this.grouped = {
-      x: getAggregate(xProperty),
-      y: getAggregate(yProperty),
-      maxes: xMaxes,
+      sorted,
+      x,
+      yKeys,
+      maxes,
     };
+    this.rerender();
   }
 
-  private _root: Selection<HTMLDivElement>;
-  private _barsHolder: Selection<SVGElement>;
-  private _axisHolder: Selection<SVGElement>;
+  private getSortedData(order: "asc" | "desc" | "alpha"): DataRow[] {
+    let evaluate: (a: DataRow, b: DataRow) => number = (_a, _b) => 0;
+    if (order === "alpha") {
+      const generateAlphaEvaluate = (property: string): typeof evaluate => (a, b) => d3.ascending(a[property] || "", b[property] || "");
+      const alphaX = generateAlphaEvaluate(this.xProperty);
+      const alphaY = generateAlphaEvaluate(this.yProperty);
+      evaluate = (a, b) => alphaY(a, b) || alphaX(a, b);
+    } else if (order === "asc" || order === "desc") {
+      const orderFn = d3[order === "asc" ? "ascending" : "descending"];
+      const generateNumEvaluate = (property: string): typeof evaluate => {
+        const sums = d3.rollup(this.data, a => d3.sum(a.map(this.getNumericValue)), d => d[property]);
+        return (a, b) => orderFn(sums.get(a[property]), sums.get(b[property]));
+      };
+      const numX = generateNumEvaluate(this.xProperty);
+      const numY = generateNumEvaluate(this.yProperty);
+      evaluate = (a, b) => numX(a, b) || numY(a, b);
+      
+      // evaluate = (a, b) => d3[order === "asc" ? "ascending" : "descending"](this.getNumericValue(a), this.getNumericValue(b));
+    }
+    return this.data.slice().sort(evaluate);
+  }
+
+  private _root: D3Selection<HTMLDivElement>;
+  private _barsHolder: D3Selection<SVGElement>;
+  private _axisHolder: D3Selection<SVGElement>;
   private get root() {
     if (!this._root) {
       this.renderScaffold();
@@ -78,8 +82,8 @@ export default class Trellis {
 
     const svg = this.root
       .append("svg")
-      .attr("viewBox", `0 0 ${this.size.width} ${this.size.height}`)
-      .style("max-width", `${this.size.width}px`)
+      .attr("viewBox", `0 0 ${this.dimensions.width} ${this.dimensions.height}`)
+      .style("max-width", `${this.dimensions.width}px`)
     ;
     this._barsHolder = svg.append("g");
     this._axisHolder = this._barsHolder.append("g");
@@ -93,15 +97,15 @@ export default class Trellis {
     return parseNumber(item) || 0;
   }
 
-  private _size: {width: number, height: number};
-  private get size() {
-    if (!this._size) {
-      this._size = {
+  private _dimensions: {width: number, height: number};
+  private get dimensions() {
+    if (!this._dimensions) {
+      this._dimensions = {
         ...size,
-        height: topPadding + size.element * Math.max(this.grouped.x.size, this.grouped.y.size) + margin.top + margin.bottom,
+        height: topPadding + size.element * Math.max(this.grouped.x.size, this.grouped.yKeys.length) + margin.top + margin.bottom,
       };
     }
-    return this._size;
+    return this._dimensions;
   }
 
   private calculateScales = () => {
@@ -114,17 +118,17 @@ export default class Trellis {
       }]
     ));
     const maxTextWidth = (map: Grouped) => d3.max(Array.from(map.keys(), getTextWidth));
-    const leftPadding = Math.max(maxTextWidth(this.grouped.x), maxTextWidth(this.grouped.y));
+    const leftPadding = Math.max(maxTextWidth(this.grouped.x), d3.max(this.grouped.yKeys.map(getTextWidth)));
 
     const xScale = d3
       .scaleLinear<number>()
-      .range([0, this.size.width - margin.right - margin.left - leftPadding - margin.between * (this.grouped.y.size - 1)])
+      .range([0, this.dimensions.width - margin.right - margin.left - leftPadding - margin.between * (this.grouped.yKeys.length - 1)])
       .domain([0, maxByXSum])
     ;
     const yScale = d3
       .scaleBand<string>()
-      .domain(this.grouped.y.keys())
-      .range([margin.top + topPadding, size.height - margin.bottom - topPadding])
+      .domain(this.grouped.yKeys)
+      .range([margin.top + topPadding, this.dimensions.height - margin.bottom - topPadding])
       .padding(0.4)
       .round(true)  // discrete values
     ;
@@ -185,16 +189,14 @@ export default class Trellis {
       .attr("font-family", font.face)
     ;
     this.axisHolder
-      .selectChildren("g.group")
+      .selectChildren("line")
       .data(this.grouped.x.keys())
-      .join(enter => 
-        enter.append("g")
-          .attr("class", "group")
-          .attr("transform", (a) => `translate(${this.getLeftOffset(a)}, ${topPadding})`)
-          .call(d3.axisLeft(this.scales.yScale))
-      )
-      .selectAll("text, line")
-      .remove()
+      .join("line")
+      .attr("stroke", "black")
+      .attr("x1", this.getLeftOffset)
+      .attr("x2", this.getLeftOffset)
+      .attr("y1", topPadding + margin.top + 15)
+      .attr("y2", this.dimensions.height - topPadding - margin.bottom - 15)
     ;
     
     this.axisHolder.selectChildren("text")
@@ -213,25 +215,25 @@ export default class Trellis {
     this.barsHolder.selectChildren("rect")
       .data(this.data)
       .join(
-        (enter) => enter
-          .append("rect")
-          .attr("fill", (a) => this.scales.colorScale(this.getNumericValue(a)))
-          .attr("width", (a) => this.scales.xScale(this.getNumericValue(a)))
-          .attr("height", this.scales.yScale.bandwidth())
+        (enter) => {
+          const rect = enter
+            .append("rect")
+            .attr("fill", (a) => this.scales.colorScale(this.getNumericValue(a)))
+            .attr("width", (a) => this.scales.xScale(this.getNumericValue(a)))
+            .attr("height", this.scales.yScale.bandwidth())
+            .attr("x", this.getLeftOffset)
+            .attr("y", (a) => this.scales.yScale(a[this.yProperty]))
+          ;
+          rect.append("title").text((a) => a[this.numericProperty]);
+          return rect;
+        },
+        (update) => update
+          .transition()
+          .duration(1000)
           .attr("x", this.getLeftOffset)
           .attr("y", (a) => this.scales.yScale(a[this.yProperty]))
         ,
-        (update) => update
-          .transition()
-          .duration(500)
-          .attr("x", this.getLeftOffset)
-          .attr("y", (a) => this.scales.yScale(a[this.yProperty]))
       )
-      // .attr("fill", (a) => this.scales.colorScale(this.getNumericValue(a)))
-      // .attr("width", (a) => this.scales.xScale(this.getNumericValue(a)))
-      // .attr("height", this.scales.yScale.bandwidth())
-      // .attr("x", this.getLeftOffset)
-      // .attr("y", (a) => this.scales.yScale(a[this.yProperty]))
     ;
   }
   public rerender() {

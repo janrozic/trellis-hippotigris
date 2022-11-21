@@ -1,4 +1,5 @@
 import { font } from "./constants";
+import { DataRow } from "./types";
 
 let canvas: HTMLCanvasElement;
 const getCanvas = (): HTMLCanvasElement => {
@@ -24,3 +25,7 @@ export function parseNumber(s: string): number {
 }
 
 export const noop = <T>(a: T): T => a;
+
+export function uniqueValues(data: DataRow[], key: string) {
+  return data.reduce<string[]>((acc, val) => acc.includes(val[key]) ? acc : [...acc, val[key]], []);
+}
